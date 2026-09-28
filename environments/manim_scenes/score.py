@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["manim", "static-ffmpeg"]
+# dependencies = ["manim"]
 # ///
 """Standalone manim scene scorer.
 
@@ -20,8 +20,8 @@ JSON facts (consumers read the last line starting with '{'):
   error         'syntax_error' | 'forbidden_construct: <what>' |
                 'no_scene_subclass' | 'not_a_scene' | 'timeout' |
                 'render_crash' | 'inspection_crash' | null
-  visible_frac  largest non-near-black pixel fraction across sampled frames
-                (25%/50%/75% of duration), or null if undecodable
+  visible_frac  non-near-black pixel fraction of the middle video frame,
+                or null if undecodable
   video_exists  a non-empty mp4 exists under ./media (anti-monkeypatch anchor)
   video_path    path of that mp4, or null
   n_plays       scene.play() calls, incl. any import-time render
@@ -188,20 +188,8 @@ def _find_video(media_dir: Path, min_mtime: float):
     return newest[0] if newest else None
 
 
-def _ffprobe() -> str | None:
-    if path := shutil.which("ffprobe"):
-        return path
-    try:
-        from static_ffmpeg import run
-
-        _ffmpeg, ffprobe = run.get_or_fetch_platform_executables_else_raise()
-        return ffprobe
-    except Exception:
-        return None
-
-
 def _duration_s(video: Path) -> float | None:
-    ffprobe = _ffprobe()
+    ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return None
     try:
@@ -215,50 +203,32 @@ def _duration_s(video: Path) -> float | None:
         return None
 
 
-def _ffmpeg() -> str | None:
-    if path := shutil.which("ffmpeg"):
-        return path
-    try:
-        from static_ffmpeg import run
-
-        ffmpeg, _ffprobe_bin = run.get_or_fetch_platform_executables_else_raise()
-        return ffmpeg
-    except Exception:
-        return None
-
-
 # Pixel threshold: a channel value above this counts as "lit". Manim's
 # background is #000, so anything drawn registers well above it.
 LIT_PIXEL = 24
 
 
 def _visible_frac(video: Path, duration_s: float) -> float | None:
-    """Max non-near-black pixel fraction across frames sampled at 25/50/75%
-    of the video. None if ffmpeg or every decode fails (undecodable video)."""
-    ffmpeg = _ffmpeg()
+    """Non-near-black pixel fraction of the frame at 50% of the video.
+    None if ffmpeg is missing or the decode fails (undecodable video)."""
+    ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg or not duration_s or duration_s <= 0:
         return None
     import numpy as np
 
-    best = None
-    for frac in (0.25, 0.5, 0.75):
-        try:
-            out = subprocess.run(
-                [ffmpeg, "-v", "error", "-ss", f"{duration_s * frac:.3f}",
-                 "-i", str(video), "-frames:v", "1", "-f", "rawvideo",
-                 "-pix_fmt", "rgb24", "-"],
-                capture_output=True, timeout=30,
-            )
-        except Exception:
-            continue
-        if out.returncode != 0 or not out.stdout:
-            continue
-        arr = np.frombuffer(out.stdout, dtype=np.uint8)
-        if arr.size == 0:
-            continue
-        frac_lit = float((arr > LIT_PIXEL).mean())
-        best = frac_lit if best is None else max(best, frac_lit)
-    return best
+    try:
+        out = subprocess.run(
+            [ffmpeg, "-v", "error", "-ss", f"{duration_s / 2:.3f}",
+             "-i", str(video), "-frames:v", "1", "-f", "rawvideo",
+             "-pix_fmt", "rgb24", "-"],
+            capture_output=True, timeout=30,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0 or not out.stdout:
+        return None
+    arr = np.frombuffer(out.stdout, dtype=np.uint8)
+    return float((arr > LIT_PIXEL).mean()) if arr.size else None
 
 
 def _timeout(signum, frame):

@@ -55,6 +55,7 @@ async def _judge_video(video: bytes, prompt: str, config: "ManimTaskConfig") -> 
                     "model": config.judge_model,
                     "temperature": 0,
                     "max_tokens": 64,
+                    "response_format": {"type": "json_object"},
                     "messages": [{
                         "role": "user",
                         "content": [
@@ -67,8 +68,7 @@ async def _judge_video(video: bytes, prompt: str, config: "ManimTaskConfig") -> 
             )
             res.raise_for_status()
         text = res.json()["choices"][0]["message"]["content"]
-        score = float(json.loads(text[text.index("{"):text.rindex("}") + 1])["score"])
-        return max(0.0, min(1.0, score))
+        return max(0.0, min(1.0, float(json.loads(text)["score"])))
     except Exception:
         return None
 
