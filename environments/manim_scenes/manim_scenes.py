@@ -5,10 +5,13 @@ Scene subclass in-process (score.py) and inspects the final frame's top-level
 mobjects for out-of-frame placement and bounding-box overlap.
 """
 
+import base64
 import json
+import os
 import re
 from pathlib import Path
 
+import httpx
 import verifiers.v1 as vf
 
 SCORER = (Path(__file__).with_name("score.py")).read_bytes()
@@ -25,6 +28,49 @@ Requirements:
 def extract_code(text: str) -> str:
     blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", text, re.S | re.I)
     return blocks[-1].strip() if blocks else text.strip()
+
+
+JUDGE_RUBRIC = """You are grading a Manim animation video. The animation was requested as:
+
+"{prompt}"
+
+Score how faithfully the video depicts that request, penalizing visual slop: overlapping elements, unreadable text, off-screen content, blank stretches. Reply with JSON only: {{"score": <float 0.0-1.0>}}"""
+
+
+async def _judge_video(video: bytes, prompt: str, config: "ManimTaskConfig") -> float | None:
+    """Faithfulness score 0-1 from a video judge over OpenRouter.
+
+    None when no key is set, the call fails, or the reply is unparseable —
+    judge outages must never tank a legitimate rollout.
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            res = await client.post(
+                f"{config.judge_base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": config.judge_model,
+                    "temperature": 0,
+                    "max_tokens": 64,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": JUDGE_RUBRIC.format(prompt=prompt)},
+                            {"type": "video_url", "video_url": {"url":
+                                "data:video/mp4;base64," + base64.b64encode(video).decode()}},
+                        ],
+                    }],
+                },
+            )
+            res.raise_for_status()
+        text = res.json()["choices"][0]["message"]["content"]
+        score = float(json.loads(text[text.index("{"):text.rindex("}") + 1])["score"])
+        return max(0.0, min(1.0, score))
+    except Exception:
+        return None
 
 
 PROMPTS: list[tuple[str, str]] = [
@@ -103,6 +149,8 @@ class ManimTaskConfig(vf.TaskConfig):
     cheat_penalty: float = -0.5      # denied construct (static scan hit)
     min_duration_s: float = 0.5      # decodable video at least this long
     min_visible_frac: float = 0.002  # best sampled frame must be ~0.2% lit
+    judge_model: str | None = None   # video-capable model id; None disables the judge
+    judge_base_url: str = "https://openrouter.ai/api/v1"
 
 
 class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
@@ -137,7 +185,17 @@ class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
         )
         if not gates_ok:
             return self.config.gate_credit
-        return max(0.4, 1.0 - self.config.violation_penalty * violations)
+        base = max(0.4, 1.0 - self.config.violation_penalty * violations)
+        # semantic layer: the video judge scores whether the render actually
+        # depicts the prompt — the cheat no static check can see. Multiply so a
+        # faithful-but-sloppy scene stays ahead of a wrong-scene render.
+        if self.config.judge_model and (video_path := facts.get("video_path")):
+            j = await _judge_video(
+                await runtime.read(video_path), trace.task.data.prompt, self.config)
+            trace.info["judge_score"] = j
+            if j is not None:
+                return base * j
+        return base
 
     async def validate(self, runtime: vf.Runtime) -> bool:
         return bool((await self._score(GOLD_SCENE, runtime)).get("renders"))
