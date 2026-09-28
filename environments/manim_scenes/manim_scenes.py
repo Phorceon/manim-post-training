@@ -99,6 +99,9 @@ class ManimData(vf.TaskData):
 class ManimTaskConfig(vf.TaskConfig):
     violation_penalty: float = 0.1  # per out-of-frame or overlap violation
     crash_credit: float = 0.2       # parseable code + Scene that fails to render
+    gate_credit: float = 0.2        # rendered but unwatchable: no mp4 / no mobjects / no play()s
+    min_mobjects: int = 1           # non-degenerate top-level mobjects required
+    min_plays: int = 1              # scene.play() calls required
 
 
 class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
@@ -119,6 +122,13 @@ class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
         trace.record_metric("renders", float(renders))
         trace.record_metric("violations", float(violations))
         if renders:
+            gates_ok = (
+                facts.get("video_exists")
+                and facts.get("n_mobjects", 0) >= self.config.min_mobjects
+                and facts.get("n_plays", 0) >= self.config.min_plays
+            )
+            if not gates_ok:
+                return self.config.gate_credit
             return max(0.4, 1.0 - self.config.violation_penalty * violations)
         crashed = str(facts.get("error") or "").startswith("render_crash")
         return self.config.crash_credit if crashed else 0.0
