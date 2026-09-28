@@ -17,8 +17,11 @@ JSON facts (consumers read the last line starting with '{'):
   n_mobjects    top-level mobjects with a non-degenerate bbox
   out_of_frame  top-level mobjects whose bbox leaves the frame
   overlaps      [a, b] pairs whose AABBs overlap past OVERLAP_MIN
-  error         'syntax_error' | 'no_scene_subclass' | 'render_crash' |
-                'inspection_crash' | null
+  error         'syntax_error' | 'forbidden_construct: <what>' |
+                'no_scene_subclass' | 'not_a_scene' | 'timeout' |
+                'render_crash' | 'inspection_crash' | null
+  visible_frac  largest non-near-black pixel fraction across sampled frames
+                (25%/50%/75% of duration), or null if undecodable
   video_exists  a non-empty mp4 exists under ./media (anti-monkeypatch anchor)
   video_path    path of that mp4, or null
   n_plays       scene.play() calls, incl. any import-time render
@@ -45,6 +48,81 @@ from itertools import combinations
 from pathlib import Path
 
 OVERLAP_MIN = 0.15  # intersection area as fraction of the smaller box
+
+# --- static denylist -------------------------------------------------------
+# Model code runs in this process, so anything it can reach it can forge.
+# These constructs are the cheat toolbox — file/socket I/O, process control,
+# code synthesis, attribute patching, interpreter introspection. Legit manim
+# scenes need none of them.
+DENY_MODULES = {
+    "os", "sys", "subprocess", "pathlib", "shutil", "socket", "atexit",
+    "signal", "builtins", "importlib", "ctypes", "threading",
+    "multiprocessing", "io", "pickle", "marshal", "inspect", "types",
+    "weakref", "gc", "code", "codeop", "traceback", "linecache",
+    "urllib", "http", "ftplib", "requests", "tempfile", "fileinput",
+    "glob", "fnmatch", "platform", "site", "sysconfig",
+}
+DENY_CALLS = {
+    "eval", "exec", "compile", "globals", "vars", "setattr", "delattr",
+    "open", "input", "breakpoint", "help", "dir", "__import__", "getattr",
+    "hasattr", "memoryview", "bytearray",
+}
+# Attribute names that must never be assignment targets — patching these is how
+# you fake the signal (render no-ops, play counters, mobject lists, bboxes).
+DENY_ATTR_WRITE = {
+    "render", "play", "wait", "add", "remove", "mobjects", "submobjects",
+    "renderer", "time", "current_time", "times", "construct",
+    "file_writer", "scene_file_writer", "get_all_points", "get_bounding_box",
+    "stdout", "stderr", "stdin", "modules", "meta_path", "path_hooks",
+    "excepthook", "lastframe", "builtin", "builtins",
+}
+# Dunder attribute access is how you escape the sandbox: __class__.__bases__,
+# f.__globals__, __subclasses__, __builtins__, __import__. A small allowlist
+# keeps super().__init__() and `if __name__ == "__main__"` working.
+DUNDER_OK = {
+    "__init__", "__name__", "__main__", "__version__", "__doc__",
+    "__file__", "__all__", "__repr__", "__str__", "__len__", "__dict__",
+}
+
+
+def forbidden_construct(tree: ast.AST) -> str | None:
+    """First denied construct in the tree, or None."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in DENY_MODULES:
+                    return f"import {alias.name}"
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").split(".")[0]
+            if mod in DENY_MODULES or mod == "":
+                return f"from {node.module} import" if mod else "from . import"
+        elif isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name) and f.id in DENY_CALLS:
+                return f"call {f.id}()"
+            if isinstance(f, ast.Attribute) and f.attr in DENY_CALLS:
+                return f"call .{f.attr}()"
+        elif isinstance(node, ast.Attribute):
+            a = node.attr
+            if a.startswith("__") and a.endswith("__") and a not in DUNDER_OK:
+                return f"dunder {a}"
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            targets = getattr(node, "targets", None) or [getattr(node, "target", None)]
+            for t in targets:
+                if t is None:
+                    continue
+                for sub in ast.walk(t):
+                    if isinstance(sub, ast.Attribute) and sub.attr in DENY_ATTR_WRITE:
+                        return f"assign .{sub.attr}"
+        elif isinstance(node, ast.Delete):
+            for t in node.targets:
+                for sub in ast.walk(t):
+                    if isinstance(sub, ast.Attribute) and (
+                        sub.attr in DENY_ATTR_WRITE
+                        or (sub.attr.startswith("__") and sub.attr not in DUNDER_OK)
+                    ):
+                        return f"del .{sub.attr}"
+    return None
 
 
 def scene_classes(code: str) -> list[str]:
@@ -137,6 +215,52 @@ def _duration_s(video: Path) -> float | None:
         return None
 
 
+def _ffmpeg() -> str | None:
+    if path := shutil.which("ffmpeg"):
+        return path
+    try:
+        from static_ffmpeg import run
+
+        ffmpeg, _ffprobe_bin = run.get_or_fetch_platform_executables_else_raise()
+        return ffmpeg
+    except Exception:
+        return None
+
+
+# Pixel threshold: a channel value above this counts as "lit". Manim's
+# background is #000, so anything drawn registers well above it.
+LIT_PIXEL = 24
+
+
+def _visible_frac(video: Path, duration_s: float) -> float | None:
+    """Max non-near-black pixel fraction across frames sampled at 25/50/75%
+    of the video. None if ffmpeg or every decode fails (undecodable video)."""
+    ffmpeg = _ffmpeg()
+    if not ffmpeg or not duration_s or duration_s <= 0:
+        return None
+    import numpy as np
+
+    best = None
+    for frac in (0.25, 0.5, 0.75):
+        try:
+            out = subprocess.run(
+                [ffmpeg, "-v", "error", "-ss", f"{duration_s * frac:.3f}",
+                 "-i", str(video), "-frames:v", "1", "-f", "rawvideo",
+                 "-pix_fmt", "rgb24", "-"],
+                capture_output=True, timeout=30,
+            )
+        except Exception:
+            continue
+        if out.returncode != 0 or not out.stdout:
+            continue
+        arr = np.frombuffer(out.stdout, dtype=np.uint8)
+        if arr.size == 0:
+            continue
+        frac_lit = float((arr > LIT_PIXEL).mean())
+        best = frac_lit if best is None else max(best, frac_lit)
+    return best
+
+
 def _timeout(signum, frame):
     raise TimeoutError(
         f"scorer exceeded {os.environ.get('MANIM_SCORE_TIMEOUT', '300')}s"
@@ -158,16 +282,22 @@ def main(path: str) -> None:
         "has_text": False,
         "has_shapes": False,
         "code_lines": 0,
+        "visible_frac": None,
     }
 
     code = Path(path).read_text()
     result["code_lines"] = sum(1 for line in code.splitlines() if line.strip())
     try:
-        names = scene_classes(code)
+        tree = ast.parse(code)
     except SyntaxError as e:
         result["error"] = f"syntax_error: {e}"
         print(json.dumps(result))
         return
+    if hit := forbidden_construct(tree):
+        result["error"] = f"forbidden_construct: {hit}"
+        print(json.dumps(result))
+        return
+    names = scene_classes(code)
     if not names:
         result["error"] = "no_scene_subclass"
         print(json.dumps(result))
@@ -201,8 +331,17 @@ def main(path: str) -> None:
 
         logging.getLogger("manim").setLevel(logging.ERROR)
         config.quality = "low_quality"
-        scene = getattr(mod, names[0])()
+        cls = getattr(mod, names[0], None)
+        if not (isinstance(cls, type) and issubclass(cls, Scene)):
+            result["error"] = "not_a_scene"
+            print(json.dumps(result))
+            return
+        scene = cls()
         scene.render()
+    except TimeoutError as e:
+        result["error"] = f"timeout: {e}"
+        print(json.dumps(result))
+        return
     except Exception as e:
         result["error"] = f"render_crash: {type(e).__name__}: {e}"
         print(json.dumps(result))
@@ -232,6 +371,10 @@ def main(path: str) -> None:
         result["video_exists"] = video is not None
         result["video_path"] = str(video) if video else None
         result["duration_s"] = _duration_s(video) if video else None
+        result["visible_frac"] = (
+            _visible_frac(video, result["duration_s"])
+            if video and result["duration_s"] else None
+        )
 
         text_types = tuple(
             t for t in (

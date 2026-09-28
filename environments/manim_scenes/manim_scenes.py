@@ -97,11 +97,12 @@ class ManimData(vf.TaskData):
 
 
 class ManimTaskConfig(vf.TaskConfig):
-    violation_penalty: float = 0.1  # per out-of-frame or overlap violation
-    crash_credit: float = 0.2       # parseable code + Scene that fails to render
-    gate_credit: float = 0.2        # rendered but unwatchable: no mp4 / no mobjects / no play()s
-    min_mobjects: int = 1           # non-degenerate top-level mobjects required
-    min_plays: int = 1              # scene.play() calls required
+    violation_penalty: float = 0.1   # per out-of-frame or overlap violation
+    crash_credit: float = 0.2        # parseable code + Scene that fails to render
+    gate_credit: float = 0.2         # rendered but artifact-unverifiable
+    cheat_penalty: float = -0.5      # denied construct (static scan hit)
+    min_duration_s: float = 0.5      # decodable video at least this long
+    min_visible_frac: float = 0.002  # best sampled frame must be ~0.2% lit
 
 
 class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
@@ -121,17 +122,22 @@ class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
         violations = len(facts.get("out_of_frame", [])) + len(facts.get("overlaps", []))
         trace.record_metric("renders", float(renders))
         trace.record_metric("violations", float(violations))
-        if renders:
-            gates_ok = (
-                facts.get("video_exists")
-                and facts.get("n_mobjects", 0) >= self.config.min_mobjects
-                and facts.get("n_plays", 0) >= self.config.min_plays
-            )
-            if not gates_ok:
-                return self.config.gate_credit
-            return max(0.4, 1.0 - self.config.violation_penalty * violations)
-        crashed = str(facts.get("error") or "").startswith("render_crash")
-        return self.config.crash_credit if crashed else 0.0
+        err = str(facts.get("error") or "")
+        if err.startswith("forbidden_construct"):
+            return self.config.cheat_penalty
+        if not renders:
+            crashed = err.startswith("render_crash")
+            return self.config.crash_credit if crashed else 0.0
+        # gate on artifacts, not in-process objects: the mp4 must decode to a
+        # watchable duration and actually show pixels. Facts like n_mobjects /
+        # n_plays stay advisory — model code can forge anything in-memory.
+        gates_ok = (
+            (facts.get("duration_s") or 0.0) >= self.config.min_duration_s
+            and (facts.get("visible_frac") or 0.0) >= self.config.min_visible_frac
+        )
+        if not gates_ok:
+            return self.config.gate_credit
+        return max(0.4, 1.0 - self.config.violation_penalty * violations)
 
     async def validate(self, runtime: vf.Runtime) -> bool:
         return bool((await self._score(GOLD_SCENE, runtime)).get("renders"))
