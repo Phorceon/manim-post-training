@@ -97,8 +97,9 @@ class ManimData(vf.TaskData):
 
 
 class ManimTaskConfig(vf.TaskConfig):
-    violation_penalty: float = 0.1  # per out-of-frame or overlap violation
-    crash_credit: float = 0.2       # parseable code + Scene that fails to render
+    violation_penalty: float = 0.1   # per out-of-frame or overlap violation
+    text_penalty: float = 0.05       # has shapes but no text element
+    crash_credit: float = 0.2        # ran (or nearly) but produced no usable scene
 
 
 class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
@@ -114,14 +115,26 @@ class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
     async def renders_clean(self, trace: vf.Trace, runtime: vf.Runtime) -> float:
         facts = await self._score(extract_code(trace.last_reply), runtime)
         trace.info["scorer"] = facts
-        renders = bool(facts.get("renders"))
         violations = len(facts.get("out_of_frame", [])) + len(facts.get("overlaps", []))
-        trace.record_metric("renders", float(renders))
+        trace.record_metric("renders", float(bool(facts.get("renders"))))
+        trace.record_metric("video", float(bool(facts.get("video_exists"))))
+        trace.record_metric("plays", float(facts.get("n_plays") or 0))
         trace.record_metric("violations", float(violations))
-        if renders:
-            return max(0.4, 1.0 - self.config.violation_penalty * violations)
-        crashed = str(facts.get("error") or "").startswith("render_crash")
-        return self.config.crash_credit if crashed else 0.0
+        real = (
+            facts.get("renders")
+            and facts.get("video_exists")
+            and (facts.get("n_plays") or 0) > 0
+            and (facts.get("n_mobjects") or 0) > 0
+        )
+        if real:
+            penalty = self.config.violation_penalty * violations
+            if facts.get("has_shapes") and not facts.get("has_text"):
+                penalty += self.config.text_penalty
+            return max(0.4, 1.0 - penalty)
+        executed = facts.get("renders") or str(facts.get("error") or "").startswith(
+            "render_crash"
+        )
+        return self.config.crash_credit if executed else 0.0
 
     async def validate(self, runtime: vf.Runtime) -> bool:
         return bool((await self._score(GOLD_SCENE, runtime)).get("renders"))
