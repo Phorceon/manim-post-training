@@ -5,13 +5,16 @@ Scene subclass in-process (score.py) and inspects the final frame's top-level
 mobjects for out-of-frame placement and bounding-box overlap.
 """
 
+import asyncio
 import json
 import re
+import tempfile
 from pathlib import Path
 
 import verifiers.v1 as vf
 
 SCORER = (Path(__file__).with_name("score.py")).read_bytes()
+JUDGER = (Path(__file__).with_name("judge.py")).read_bytes()
 
 SYSTEM_PROMPT = """You write animations with Manim Community Edition. Respond with exactly one ```python code block and no prose.
 
@@ -100,6 +103,8 @@ class ManimTaskConfig(vf.TaskConfig):
     violation_penalty: float = 0.1   # per out-of-frame or overlap violation
     text_penalty: float = 0.05       # has shapes but no text element
     crash_credit: float = 0.2        # ran (or nearly) but produced no usable scene
+    use_judge: bool = False          # call the SWE-2 VLM judge on rendered scenes
+    judge_weight: float = 0.5        # blend: final = base*(1-w) + judge*w
 
 
 class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
@@ -110,6 +115,23 @@ class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
             if line.startswith("{"):
                 return json.loads(line)
         return {"renders": False, "error": f"scorer_no_output: {res.stderr[-500:]}"}
+
+    async def _judge(self, video_path: str, runtime: vf.Runtime) -> dict:
+        """Run the host-side Devin VLM judge on the rendered mp4."""
+        workdir = Path(tempfile.mkdtemp(prefix="manim-judge-"))
+        (workdir / "judge.py").write_bytes(JUDGER)
+        (workdir / "v.mp4").write_bytes(await runtime.read(video_path))
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "judge.py", "v.mp4", self.data.prompt_text,
+            cwd=workdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        for line in reversed(stdout.decode(errors="replace").splitlines()):
+            if line.startswith("{"):
+                return json.loads(line)
+        return {"judge": False, "error": "judge_no_output"}
 
     @vf.reward
     async def renders_clean(self, trace: vf.Trace, runtime: vf.Runtime) -> float:
@@ -130,7 +152,21 @@ class ManimTask(vf.Task[ManimData, vf.State, ManimTaskConfig]):
             penalty = self.config.violation_penalty * violations
             if facts.get("has_shapes") and not facts.get("has_text"):
                 penalty += self.config.text_penalty
-            return max(0.4, 1.0 - penalty)
+            base = max(0.4, 1.0 - penalty)
+            if self.config.use_judge and facts.get("video_path"):
+                verdict = await self._judge(facts["video_path"], runtime)
+                trace.info["judge"] = verdict
+                if verdict.get("judge"):
+                    js = (
+                        0.4 * (1.0 - float(verdict["overlap"]))
+                        + 0.3 * float(verdict["composition"])
+                        + 0.3 * float(verdict["matches_prompt"])
+                    )
+                    for k in ("overlap", "composition", "matches_prompt"):
+                        trace.record_metric(f"judge_{k}", float(verdict[k] or 0))
+                    w = self.config.judge_weight
+                    return base * (1 - w) + js * w
+            return base
         executed = facts.get("renders") or str(facts.get("error") or "").startswith(
             "render_crash"
         )

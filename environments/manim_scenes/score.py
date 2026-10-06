@@ -64,24 +64,25 @@ def descendants(m):
         yield from descendants(s)
 
 
-def video_info(media_dir: str) -> tuple[bool, float | None]:
+def video_info(media_dir: str) -> tuple[bool, str | None, float | None]:
     vids = [v for v in Path(media_dir).rglob("*.mp4") if v.stat().st_size > 0]
     if not vids:
-        return False, None
+        return False, None, None
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", str(vids[0])],
             capture_output=True, text=True, timeout=15,
         )
-        return True, float(r.stdout.strip())
+        return True, str(vids[0]), float(r.stdout.strip())
     except Exception:
-        return True, None
+        return True, str(vids[0]), None
 
 
 def main(path: str) -> None:
     out = {
-        "renders": False, "video_exists": False, "duration_s": None,
+        "renders": False, "video_exists": False, "video_path": None,
+        "duration_s": None,
         "scene": None, "n_plays": 0, "n_mobjects": 0,
         "has_text": False, "has_shapes": False, "code_lines": 0,
         "out_of_frame": [], "overlaps": [], "error": None,
@@ -131,7 +132,9 @@ def main(path: str) -> None:
         return print_out()
 
     out["renders"] = True
-    out["video_exists"], out["duration_s"] = video_info(config.media_dir)
+    out["video_exists"], out["video_path"], out["duration_s"] = video_info(
+        config.media_dir
+    )
 
     try:
         from manim import MarkupText, MathTex, Tex, Text
